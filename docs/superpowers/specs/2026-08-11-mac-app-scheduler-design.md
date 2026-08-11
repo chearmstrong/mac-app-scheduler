@@ -241,9 +241,11 @@ The installer:
 2. Resolves and validates the requested non-root, non-administrator account.
 3. Locates an explicit or `PATH` Python 3.11+ and records its actual path in
    diagnostics.
-4. Creates a staging virtual environment, installs the local package and pinned
-   compatible runtime dependencies, then moves the completed installation into
-   place.
+4. Stages and validates source assets, backs up an existing library directory,
+   then creates the virtual environment at its final absolute path and installs
+   the local package plus pinned compatible runtime dependencies. Python virtual
+   environments are not relocatable, so a completed environment is never moved
+   from a temporary path.
 5. Installs the wrapper, example-derived configuration, and plist with explicit
    `root:wheel` ownership and modes. Existing configuration and state are
    preserved on repair/update.
@@ -251,9 +253,10 @@ The installer:
 7. Uses `launchctl bootstrap system <plist>` and prints `launchctl print`
    diagnostics on failure. It does not use deprecated `load` or `unload`.
 
-Rollback keeps the prior installation until the staged replacement validates.
-Installation errors identify the failed precondition and leave existing policy
-intact. The initial dependency download is a documented network and
+Rollback restores the backed-up library directory if creation or validation of
+the replacement fails; launchd state is not changed until the replacement is
+valid. Installation errors identify the failed precondition and leave existing
+policy intact. The initial dependency download is a documented network and
 supply-chain boundary; release packaging may later provide prebuilt, hashed
 wheels without changing runtime architecture.
 
