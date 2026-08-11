@@ -1,0 +1,21 @@
+version: 1
+user: example-user
+check_interval_seconds: 45
+termination_grace_seconds: 5
+
+rules:
+  - id: facetime
+    name: FaceTime
+    bundle_id: com.apple.FaceTime
+    process_name: FaceTime
+    block:
+      from: "20:00"
+      until: "07:00"
+
+  - id: chrome
+    name: Google Chrome
+    bundle_id: com.google.Chrome
+    process_name: Google Chrome
+    block:
+      from: "21:00"
+      until: "07:00"
