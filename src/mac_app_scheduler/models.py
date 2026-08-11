@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import time
+from collections.abc import Mapping
+from dataclasses import dataclass, field
+from datetime import datetime, time
 
 
 @dataclass(frozen=True)
@@ -34,3 +35,12 @@ class SchedulerConfig:
     check_interval_seconds: int
     termination_grace_seconds: int
     rules: tuple[Rule, ...]
+
+
+@dataclass(frozen=True)
+class SchedulerState:
+    """Root-owned operational state, separate from permanent policy."""
+
+    version: int = 1
+    enabled: bool = True
+    overrides: Mapping[str, datetime] = field(default_factory=dict)
