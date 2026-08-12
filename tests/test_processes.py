@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 import plistlib
+import sys
 from datetime import time
 from pathlib import Path
 
 from mac_app_scheduler.models import Rule, TimeWindow
 from mac_app_scheduler.processes import (
+    DarwinProcessAdapter,
     ProcessInfo,
     bundle_ids_for_executable,
     matches_rule,
@@ -54,3 +57,10 @@ def test_name_fallback_is_exact() -> None:
 
     assert matches_rule(matching, FACETIME, expected_uid=501)
     assert not matches_rule(different, FACETIME, expected_uid=501)
+
+
+def test_darwin_adapter_can_inventory_the_current_user() -> None:
+    if sys.platform != "darwin":
+        return
+    processes = DarwinProcessAdapter().list_processes(os.getuid())
+    assert any(process.pid == os.getpid() for process in processes)
