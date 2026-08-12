@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import argparse
 import os
+import subprocess
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
 from mac_app_scheduler.config import load_config
+from mac_app_scheduler.daemon import run_daemon, run_once
 from mac_app_scheduler.launchd import LaunchdClient
+from mac_app_scheduler.processes import DarwinProcessAdapter
 from mac_app_scheduler.state import StateStore, parse_duration
 
 
@@ -36,13 +39,24 @@ def main(
     paths = paths or AppPaths()
     parser = _parser()
     args = parser.parse_args(argv)
+    state_store = StateStore(paths.state, paths.lock)
+    if args.command == "daemon":
+        return run_daemon(paths.config, state_store)
     if args.command == "validate-config":
         load_config(paths.config)
         print("configuration is valid")
         return 0
     if euid() != 0:
         parser.error("this command requires sudo")
-    state_store = StateStore(paths.state, paths.lock)
+    if args.command == "dry-run":
+        run_once(
+            paths.config,
+            state_store.prune_expired(now()),
+            DarwinProcessAdapter(),
+            dry_run=True,
+        )
+        print("dry run complete")
+        return 0
     if args.command == "status":
         config = load_config(paths.config)
         state = state_store.read()
@@ -56,6 +70,13 @@ def main(
         launchd().kickstart()
         print("daemon reloaded")
         return 0
+    if args.command in {"install", "uninstall"}:
+        script = (
+            Path("/usr/local/libexec/mac-app-scheduler/source")
+            / "scripts"
+            / (f"{args.command}.sh")
+        )
+        return subprocess.run([str(script), *args.script_args], check=False).returncode
     if args.command in {"enable", "disable"}:
         state_store.set_enabled(args.command == "enable")
         print(f"scheduler {args.command}d")
@@ -76,8 +97,13 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="mac-app-scheduler")
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("validate-config")
+    commands.add_parser("daemon")
     commands.add_parser("status")
     commands.add_parser("reload")
+    commands.add_parser("dry-run")
+    for command in ("install", "uninstall"):
+        subparser = commands.add_parser(command)
+        subparser.add_argument("script_args", nargs=argparse.REMAINDER)
     commands.add_parser("enable")
     commands.add_parser("disable")
     allow = commands.add_parser("allow")
