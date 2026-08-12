@@ -59,10 +59,19 @@ def test_status_reports_state_without_enforcing_processes(
 ) -> None:
     app_paths = paths(tmp_path)
 
-    assert main(["status"], paths=app_paths, euid=lambda: 0) == 0
+    assert (
+        main(
+            ["status"],
+            paths=app_paths,
+            euid=lambda: 0,
+            launchd=lambda: RecordingLaunchd(),
+        )
+        == 0
+    )
 
     output = capsys.readouterr().out
     assert "scheduler: enabled" in output
+    assert "launchd: loaded" in output
     assert "facetime" in output
 
 
@@ -72,6 +81,11 @@ class RecordingLaunchd:
 
     def kickstart(self) -> None:
         self.restarted = True
+
+    def status(self):
+        from subprocess import CompletedProcess
+
+        return CompletedProcess([], 0, "service information", "")
 
 
 def test_reload_validates_config_then_restarts_service(tmp_path: Path) -> None:

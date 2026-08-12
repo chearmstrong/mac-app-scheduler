@@ -61,6 +61,8 @@ def main(
         config = load_config(paths.config)
         state = state_store.read()
         print(f"scheduler: {'enabled' if state.enabled else 'disabled'}")
+        service = launchd().status()
+        print(f"launchd: {'loaded' if service.returncode == 0 else 'not loaded'}")
         print(f"user: {config.user}")
         for rule in config.rules:
             print(f"rule: {rule.id}")
