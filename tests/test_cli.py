@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from subprocess import CompletedProcess
 
 import pytest
 
@@ -81,6 +82,7 @@ class RecordingLaunchd:
 
     def kickstart(self) -> None:
         self.restarted = True
+        return CompletedProcess([], 0, "", "")
 
     def status(self):
         from subprocess import CompletedProcess
@@ -97,3 +99,125 @@ def test_reload_validates_config_then_restarts_service(tmp_path: Path) -> None:
 
     assert result == 0
     assert service.restarted is True
+
+
+@pytest.mark.parametrize(
+    "args, suffix",
+    [
+        (
+            ["install", "--user", "example-user", "--python", "/python"],
+            ["--user", "example-user", "--python", "/python"],
+        ),
+        (["uninstall", "--yes"], ["--yes"]),
+    ],
+)
+def test_install_commands_forward_documented_options(tmp_path, args, suffix):
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        return CompletedProcess(command, 0)
+
+    assert main(args, paths=paths(tmp_path), euid=lambda: 0, script_runner=run) == 0
+    assert calls[0][1:] == suffix
+
+
+def test_reload_reports_launchctl_failure(tmp_path, capsys):
+    class Failed(RecordingLaunchd):
+        def kickstart(self):
+            return CompletedProcess([], 5, "", "service missing")
+
+    assert main(["reload"], paths=paths(tmp_path), euid=lambda: 0, launchd=Failed) != 0
+    output = capsys.readouterr()
+    assert "service missing" in output.err
+    assert "daemon reloaded" not in output.out
+
+
+def test_reload_does_not_restart_with_invalid_config(tmp_path):
+    app_paths = paths(tmp_path)
+    app_paths.config.write_text("bad: [")
+    service = RecordingLaunchd()
+    assert (
+        main(["reload"], paths=app_paths, euid=lambda: 0, launchd=lambda: service) != 0
+    )
+    assert not service.restarted
+
+
+def test_dry_run_prints_actions_and_does_not_mutate_state(tmp_path, capsys):
+    from mac_app_scheduler.processes import ProcessInfo
+
+    class Processes:
+        def list_processes(self, uid):
+            return [
+                ProcessInfo(
+                    123, uid, "FaceTime", None, frozenset({"com.apple.FaceTime"})
+                )
+            ]
+
+        def send_signal(self, *args):
+            pytest.fail("dry run signalled a process")
+
+    app_paths = paths(tmp_path)
+    assert (
+        main(
+            ["dry-run"],
+            paths=app_paths,
+            euid=lambda: 0,
+            adapter=Processes(),
+            uid_resolver=lambda _: 501,
+            now=lambda: datetime(2026, 11, 1, 21, tzinfo=UTC),
+        )
+        == 0
+    )
+    assert "would send SIGTERM to facetime (PID 123)" in capsys.readouterr().out
+    assert not app_paths.state.exists()
+
+
+def test_cli_logs_override_creation_and_enable_disable(tmp_path, caplog):
+    import logging
+
+    caplog.set_level(logging.INFO)
+    app_paths = paths(tmp_path)
+    main(["allow", "facetime", "30m"], paths=app_paths, euid=lambda: 0)
+    main(["disable"], paths=app_paths, euid=lambda: 0)
+    assert "override created: facetime" in caplog.text
+    assert "scheduler disabled" in caplog.text
+
+
+def test_render_config_validates_real_example_and_writes_requested_user(tmp_path):
+    from mac_app_scheduler.config import load_config
+
+    config = tmp_path / "config.yaml"
+    root = Path(__file__).parents[1]
+    app_paths = AppPaths(config, tmp_path / "state.json", tmp_path / "state.lock")
+    assert (
+        main(
+            [
+                "render-config",
+                "--example",
+                str(root / "config.example.yaml"),
+                "--user",
+                "example-user",
+            ],
+            paths=app_paths,
+            euid=lambda: 0,
+        )
+        == 0
+    )
+    rendered = load_config(config)
+    assert rendered.user == "example-user"
+    assert [r.id for r in rendered.rules] == ["facetime", "chrome"]
+
+
+def test_cli_help_exposes_installer_options_in_real_entrypoint():
+    import subprocess
+    import sys
+
+    result = subprocess.run(
+        [sys.executable, "-m", "mac_app_scheduler", "install", "--help"],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0
+    assert "--user" in result.stdout
+    assert "--python" in result.stdout

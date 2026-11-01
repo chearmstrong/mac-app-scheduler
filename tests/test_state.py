@@ -26,6 +26,17 @@ def test_malformed_state_fails_closed_without_overwriting(tmp_path) -> None:
     assert path.read_text() == "not json"
 
 
+def test_malformed_state_exposes_error_for_daemon_diagnostics(tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text("not json")
+    state_store = store(tmp_path)
+    state_store.read()
+    assert state_store.error is not None
+    state_store.set_enabled(True)
+    state_store.read()
+    assert state_store.error is None
+
+
 def test_override_round_trips_as_utc_and_expires(tmp_path) -> None:
     expiry = datetime(2026, 8, 11, 20, 30, tzinfo=UTC)
     state_store = store(tmp_path)

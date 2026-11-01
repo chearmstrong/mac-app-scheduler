@@ -1,5 +1,10 @@
 # Mac App Scheduler Implementation Plan
 
+This is the original implementation task breakdown, rather than an operator
+guide or a record of current interfaces. Use [the README](../../../README.md)
+for supported commands and recovery procedures, and
+[the design](../specs/2026-08-11-mac-app-scheduler-design.md) for runtime contracts.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a root-administered macOS daemon and CLI that continuously enforces per-app blocking windows for one standard user.

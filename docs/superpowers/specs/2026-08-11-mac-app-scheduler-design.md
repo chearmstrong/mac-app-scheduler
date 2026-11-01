@@ -61,9 +61,13 @@ kernel process metadata and POSIX signals instead.
 /usr/local/bin/mac-app-scheduler
 /usr/local/libexec/mac-app-scheduler/
   ├── venv/
-  ├── package source and metadata
-  ├── install.sh
-  └── uninstall.sh
+  └── source/
+      ├── src/mac_app_scheduler/
+      ├── scripts/install.sh
+      ├── scripts/uninstall.sh
+      ├── launchd/
+      ├── pyproject.toml
+      └── config.example.yaml
 /Library/Application Support/MacAppScheduler/
   ├── config.yaml
   ├── state.json
@@ -113,8 +117,8 @@ IDs, a bundle ID, a process-name fallback, and `HH:MM` endpoints. Intervals are
 bounded to 30–60 seconds and termination grace to 1–30 seconds. Unknown keys
 are rejected so misspellings cannot silently weaken enforcement.
 
-The configured username is resolved with the system account database each time
-configuration is activated. Numeric UIDs and home-directory paths are never
+The configured username is resolved with the system account database on each
+enabled enforcement pass. Numeric UIDs and home-directory paths are never
 stored. A missing account is an actionable error and no processes are touched.
 
 At startup, malformed configuration leaves the daemon alive but inactive and
@@ -136,8 +140,9 @@ inclusive and the `until` boundary is exclusive.
 Spring-forward nonexistent wall times simply have no matching instant. During
 a fall-back repeated hour, the same wall-clock rule applies in both folds. This
 is predictable for availability schedules and is covered by timezone-sensitive
-tests. Up to the 45-second reconciliation interval is expected between a wall
-clock boundary or app launch and enforcement.
+tests. The default pause between passes is 45 seconds; process discovery and
+per-rule grace periods add to the time between checks. Enforcement is eventual
+and does not promise an exact cutoff instant.
 
 ## Mutable State and Temporary Overrides
 
@@ -172,20 +177,24 @@ bundle. The configured process name is a documented fallback for the main
 process when bundle metadata cannot be read; fallback matching is exact, not a
 substring or shell-command-line match.
 
-The daemon never shells out to `pkill` with user-provided text. It rescans and
-revalidates UID and app identity immediately before each signal to limit PID
-reuse races.
+The daemon never shells out to `pkill` with user-provided text. The adapter uses
+`proc_listallpids`, `proc_pidinfo(PROC_PIDTBSDINFO)` and `proc_pidpath` through
+`ctypes`/`libproc`. It refreshes UID, executable, bundle IDs and start time
+immediately before signalling. PID-based `kill` cannot make the metadata check
+and signal delivery atomic; these checks narrow the remaining race rather than
+claiming a hardened process handle.
 
 For a blocked rule, termination proceeds as follows:
 
-1. Identify matching main processes using both bundle identity and exact
-   configured process name.
-2. Send `SIGTERM` to those main processes and log one concise enforcement event.
-3. Wait up to the configured grace period, checking whether matching processes
-   remain.
-4. Rescan and send `SIGKILL` only to remaining processes that still match the
-   target UID and bundle, including helpers orphaned by an unresponsive main
-   process.
+1. Snapshot matching processes and select main processes by exact name. When
+   only matching orphan helpers remain, select those helpers instead.
+2. Revalidate identity, send `SIGTERM` to selected processes, and log actions.
+3. Wait for the configured grace period. Shutdown interrupts the wait without
+   triggering force termination.
+4. Revalidate the original bundle processes and send `SIGKILL` only to survivors
+   with unchanged identity. An app relaunched during the wait receives its own
+   graceful opportunity on the next pass. Name-only fallbacks never receive
+   `SIGKILL`.
 
 Sending `SIGTERM` to Chrome's main process is the best non-GUI-session graceful
 request available to the root daemon and normally allows profile/session state
@@ -216,11 +225,11 @@ sudo mac-app-scheduler disable
 sudo mac-app-scheduler reload
 sudo mac-app-scheduler allow facetime 30m
 sudo mac-app-scheduler dry-run
-sudo mac-app-scheduler uninstall
+sudo mac-app-scheduler uninstall --yes
 ```
 
-`install` repairs or updates an installation from a source checkout when its
-packaged assets are available. The shell installer remains the canonical first
+`install` repairs an installation from its installed source snapshot. Updating
+from newer source uses that checkout's shell installer. The shell installer is the first
 install because the CLI does not yet exist in `/usr/local/bin`. Mutating and
 process-inspecting commands require root and fail with a direct `sudo` hint.
 
@@ -243,27 +252,30 @@ The installer:
    diagnostics.
 4. Stages and validates source assets, backs up an existing library directory,
    then creates the virtual environment at its final absolute path and installs
-   the local package plus pinned compatible runtime dependencies. Python virtual
+   the local package plus the runtime dependencies declared in `pyproject.toml`.
+   The version ranges are not a hash-locked dependency set. Python virtual
    environments are not relocatable, so a completed environment is never moved
    from a temporary path.
 5. Installs the wrapper, example-derived configuration, and plist with explicit
    `root:wheel` ownership and modes. Existing configuration and state are
    preserved on repair/update.
 6. Validates YAML and runs `plutil -lint` before changing launchd state.
-7. Uses `launchctl bootstrap system <plist>` and prints `launchctl print`
-   diagnostics on failure. It does not use deprecated `load` or `unload`.
+7. Uses `launchctl bootstrap system <plist>` followed by a service lookup and
+   reports command diagnostics on failure. Service lookup confirms registration,
+   not successful GUI-app enforcement. It does not use `load` or `unload`.
 
-Rollback restores the backed-up library directory if creation or validation of
-the replacement fails; launchd state is not changed until the replacement is
-valid. Installation errors identify the failed precondition and leave existing
-policy intact. The initial dependency download is a documented network and
-supply-chain boundary; release packaging may later provide prebuilt, hashed
-wheels without changing runtime architecture.
+Rollback retains the library and wrapper/config/plist snapshots through config
+validation, plist validation, bootstrap and service lookup. Failure restores the
+old files and reloads the previous service if it was stopped. If recovery also
+fails, the backup directory is retained and its path is reported. The installer
+uses an advisory lock and stages source before replacing it, including during
+self-repair. The initial dependency download is a documented network boundary.
 
 Uninstall first uses `launchctl bootout system/<label>` when loaded, then removes
 only the exact installed executable, library directory, plist, and application
-support directory. It is idempotent, reports what was removed, and warns before
-removing configuration/state. The README also documents a manual recovery path.
+support directory. It requires `--yes`, reports what was removed, retains logs,
+and aborts before deletion if stopping the loaded service fails. The README
+documents recovery from a retained installation backup.
 
 ## Logging and Failures
 
@@ -273,9 +285,10 @@ temporary override creation/expiry, enable/disable transitions, and unexpected
 exceptions. Successful no-op cycles are silent. Repeated identical errors are
 deduplicated until their condition changes.
 
-The implementation emits sparse records to macOS system logging and keeps
-stderr useful as a fallback; launchd captures stderr in a root-owned diagnostic
-log. CLI documentation includes `log show` and fallback-log commands.
+The implementation emits timestamped standard Python logging records to stderr.
+Launchd captures daemon stderr in `/var/log/mac-app-scheduler.log`; CLI mutations
+and override creation are reported on CLI stderr. The README provides service
+and file-log troubleshooting commands.
 Usernames appear only when needed to diagnose account resolution, and command
 lines, document names, browser URLs, and unrelated process details are never
 logged.
@@ -323,7 +336,7 @@ They run without macOS or root privileges. Unit tests cover:
 
 macOS-focused tests validate executable-path discovery, plist syntax, and shell
 scripts without terminating GUI apps. GitHub Actions runs pytest and Ruff on
-Python 3.11–3.13, with Linux for portable logic and macOS for Darwin-specific
+Python 3.11 and 3.13, with Linux for portable logic and macOS for Darwin-specific
 checks. Shell scripts receive `bash -n`; the LaunchDaemon receives
 `plutil -lint` on macOS.
 
@@ -341,7 +354,8 @@ near-future rules and a disposable browser profile where practical:
 1. Validate config and run `dry-run`.
 2. Bootstrap and inspect daemon status/logs.
 3. Test FaceTime and Chrome while already open at a near-future cutoff.
-4. Reopen each blocked app and confirm closure within 45 seconds.
+4. Reopen each blocked app and confirm closure on the next pass, allowing for
+   the configured interval and other rules' grace periods.
 5. Confirm an allow override, its expiry, disable, and enable.
 6. Test logout/login, reboot, and sleep across a cutoff.
 7. Confirm another user's similarly named processes are untouched.

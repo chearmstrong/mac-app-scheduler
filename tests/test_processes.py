@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import plistlib
 import sys
+from dataclasses import replace
 from datetime import time
 from pathlib import Path
 
@@ -63,4 +64,21 @@ def test_darwin_adapter_can_inventory_the_current_user() -> None:
     if sys.platform != "darwin":
         return
     processes = DarwinProcessAdapter().list_processes(os.getuid())
-    assert any(process.pid == os.getpid() for process in processes)
+    current = next(process for process in processes if process.pid == os.getpid())
+    assert current.uid == os.getuid()
+    assert current.start_time[0] > 0
+    assert current.executable.is_file()
+    # Framework Python can run via Python.app rather than sys.executable's launcher.
+    assert current.executable.is_absolute()
+    assert DarwinProcessAdapter().refresh(os.getpid(), os.getuid()) == current
+    assert DarwinProcessAdapter().refresh(os.getpid(), os.getuid() + 1) is None
+
+
+def test_signal_rechecks_identity_at_the_adapter_boundary(monkeypatch):
+    adapter = object.__new__(DarwinProcessAdapter)
+    original = ProcessInfo(17, 501, "FaceTime", None, frozenset(), (1, 0))
+    monkeypatch.setattr(adapter, "refresh", lambda *_: replace(original, uid=502))
+    signals = []
+    monkeypatch.setattr(os, "kill", lambda *args: signals.append(args))
+    assert adapter.send_signal(original, 15) is False
+    assert signals == []

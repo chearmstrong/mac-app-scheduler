@@ -24,6 +24,7 @@ class StateStore:
     def __init__(self, path: Path, lock_path: Path) -> None:
         self.path = path
         self.lock_path = lock_path
+        self.error: str | None = None
 
     def read(self) -> SchedulerState:
         with self._lock():
@@ -75,23 +76,27 @@ class StateStore:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
     def _read_unlocked(self) -> SchedulerState:
+        self.error = None
         try:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
             if not isinstance(raw, dict) or raw.get("version") != 1:
-                return SchedulerState()
+                raise ValueError("unsupported state schema")
             enabled = raw.get("enabled")
             overrides = raw.get("overrides")
             if not isinstance(enabled, bool) or not isinstance(overrides, dict):
-                return SchedulerState()
+                raise ValueError("invalid enabled or overrides fields")
             parsed = {
                 rule_id: _parse_expiry(value)
                 for rule_id, value in overrides.items()
                 if isinstance(rule_id, str) and isinstance(value, str)
             }
             if len(parsed) != len(overrides):
-                return SchedulerState()
+                raise ValueError("invalid override entry")
             return SchedulerState(enabled=enabled, overrides=parsed)
-        except (OSError, ValueError, json.JSONDecodeError):
+        except FileNotFoundError:
+            return SchedulerState()
+        except (OSError, ValueError) as exc:
+            self.error = str(exc)
             return SchedulerState()
 
     def _write_unlocked(self, state: SchedulerState) -> None:

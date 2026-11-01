@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import signal
 import threading
+import time
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -15,9 +16,10 @@ from mac_app_scheduler.config import (
     load_config,
     resolve_user,
 )
-from mac_app_scheduler.enforcer import Enforcer, ProcessAdapter
+from mac_app_scheduler.enforcer import Enforcer, ProcessAdapter, ReconcileResult
 from mac_app_scheduler.models import SchedulerState
 from mac_app_scheduler.processes import DarwinProcessAdapter
+from mac_app_scheduler.schedule import is_rule_blocked
 from mac_app_scheduler.state import StateStore
 
 
@@ -56,34 +58,105 @@ class ConfigMonitor:
         return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
 
 
-def run_daemon(
-    config_path: Path,
-    state_store: StateStore,
-    adapter: ProcessAdapter | None = None,
-) -> int:
-    """Enforce immediately, then reconcile after each configured interval."""
+class Daemon:
+    """One recoverable reconciliation cycle and its transition log state."""
 
+    def __init__(self, config_path, state_store, adapter, uid_resolver, sleeper):
+        self.monitor = ConfigMonitor(config_path)
+        self.state_store = state_store
+        self.enforcer = Enforcer(adapter, uid_resolver, sleeper)
+        self.logger = logging.getLogger("mac-app-scheduler")
+        self._conditions = {}
+
+    def _changed(self, key, value, message, *, error=False):
+        if key not in self._conditions or self._conditions[key] != value:
+            self._conditions[key] = value
+            if message:
+                (self.logger.error if error else self.logger.info)(message)
+
+    def cycle(self, now: datetime) -> int:
+        config = None
+        try:
+            config = self.monitor.current()
+            error = str(self.monitor.error) if self.monitor.error else None
+            self._changed(
+                "config-error",
+                error,
+                f"configuration error: {error}" if error else None,
+                error=True,
+            )
+            if config is None:
+                return 45
+            self._changed("config", config, "configuration activated")
+            before = self.state_store.read()
+            state_error = self.state_store.error
+            self._changed(
+                "state-error",
+                state_error,
+                f"state error: {state_error}" if state_error else None,
+                error=True,
+            )
+            state = self.state_store.prune_expired(now)
+            for rule_id in before.overrides.keys() - state.overrides.keys():
+                self.logger.info("override expired: %s", rule_id)
+            self._changed(
+                "enabled",
+                state.enabled,
+                f"scheduler {'enabled' if state.enabled else 'disabled'}",
+            )
+            for rule in config.rules:
+                blocked = state.enabled and is_rule_blocked(
+                    rule, now, state.overrides.get(rule.id)
+                )
+                self._changed(
+                    f"rule:{rule.id}",
+                    blocked,
+                    f"rule {rule.id}: {'blocked' if blocked else 'allowed'}",
+                )
+            result = self.enforcer.reconcile(config, state, now)
+            for action in result.actions:
+                self.logger.info(
+                    "%s: sent %s to PID %s",
+                    action.rule_id,
+                    action.signal.name,
+                    action.pid,
+                )
+            errors = tuple(result.errors)
+            self._changed("enforcement-errors", errors, "; ".join(errors), error=True)
+            self._changed("cycle-error", None, None)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            self._changed(
+                "cycle-error", error, f"enforcement error: {error}", error=True
+            )
+        return config.check_interval_seconds if config else 45
+
+
+def run_daemon(
+    config_path: Path, state_store: StateStore, adapter: ProcessAdapter | None = None
+) -> int:
+    """Enforce immediately, then reconcile until launchd requests shutdown."""
     stop = threading.Event()
-    signal.signal(signal.SIGTERM, lambda *_: stop.set())
-    signal.signal(signal.SIGINT, lambda *_: stop.set())
+    previous = {
+        sig: signal.signal(sig, lambda *_: stop.set())
+        for sig in (signal.SIGTERM, signal.SIGINT)
+    }
     logger = logging.getLogger("mac-app-scheduler")
-    monitor = ConfigMonitor(config_path)
-    process_adapter = adapter or DarwinProcessAdapter()
-    logger.warning("daemon started")
-    while not stop.is_set():
-        config = monitor.current()
-        if config is None:
-            if monitor.error is not None:
-                logger.error("configuration error: %s", monitor.error)
-            stop.wait(45)
-            continue
-        state = state_store.prune_expired(datetime.now().astimezone())
-        enforcer = Enforcer(
-            process_adapter, lambda user: resolve_user(user).pw_uid, stop.wait
+    try:
+        worker = Daemon(
+            config_path,
+            state_store,
+            adapter or DarwinProcessAdapter(),
+            lambda user: resolve_user(user).pw_uid,
+            stop.wait,
         )
-        enforcer.reconcile(config, state, datetime.now().astimezone())
-        stop.wait(config.check_interval_seconds)
-    logger.warning("daemon stopped")
+        logger.info("daemon started")
+        while not stop.is_set():
+            stop.wait(worker.cycle(datetime.now().astimezone()))
+    finally:
+        logger.info("daemon stopped")
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
     return 0
 
 
@@ -93,10 +166,11 @@ def run_once(
     adapter: ProcessAdapter,
     *,
     dry_run: bool,
-) -> None:
+    now: datetime | None = None,
+) -> ReconcileResult:
     """Perform one optional dry-run enforcement pass."""
 
     config = load_config(config_path)
-    Enforcer(adapter, lambda user: resolve_user(user).pw_uid, lambda _: None).reconcile(
-        config, state, datetime.now().astimezone(), dry_run
-    )
+    return Enforcer(
+        adapter, lambda user: resolve_user(user).pw_uid, time.sleep
+    ).reconcile(config, state, now or datetime.now().astimezone(), dry_run)

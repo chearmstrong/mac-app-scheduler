@@ -33,7 +33,7 @@ def load_config(path: Path) -> SchedulerConfig:
 
     try:
         return parse_config(path.read_text(encoding="utf-8"))
-    except OSError as exc:
+    except (OSError, UnicodeError) as exc:
         raise ConfigError(f"config: unable to read {path}: {exc}") from exc
 
 

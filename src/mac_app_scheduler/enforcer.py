@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import signal
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Protocol
 
@@ -14,7 +15,23 @@ from mac_app_scheduler.schedule import is_rule_blocked
 
 class ProcessAdapter(Protocol):
     def list_processes(self, uid: int) -> list[ProcessInfo]: ...
-    def send_signal(self, pid: int, value: signal.Signals) -> None: ...
+    def refresh(self, pid: int, uid: int) -> ProcessInfo | None: ...
+    def send_signal(
+        self, process: ProcessInfo, value: signal.Signals
+    ) -> bool | None: ...
+
+
+@dataclass(frozen=True)
+class Action:
+    rule_id: str
+    pid: int
+    signal: signal.Signals
+
+
+@dataclass
+class ReconcileResult:
+    actions: list[Action] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
 
 class Enforcer:
@@ -22,7 +39,7 @@ class Enforcer:
         self,
         adapter: ProcessAdapter,
         uid_resolver: Callable[[str], int],
-        sleeper: Callable[[float], None],
+        sleeper: Callable[[float], object],
     ) -> None:
         self.adapter, self.uid_resolver, self.sleeper = adapter, uid_resolver, sleeper
 
@@ -32,27 +49,58 @@ class Enforcer:
         state: SchedulerState,
         now: datetime,
         dry_run: bool = False,
-    ) -> None:
+    ) -> ReconcileResult:
+        result = ReconcileResult()
         if not state.enabled:
-            return
+            return result
         uid = self.uid_resolver(config.user)
         for rule in config.rules:
             if not is_rule_blocked(rule, now, state.overrides.get(rule.id)):
                 continue
-            candidates = [
-                p
-                for p in self.adapter.list_processes(uid)
-                if matches_rule(p, rule, uid) and is_main_process(p, rule)
-            ]
-            if not dry_run:
-                for process in candidates:
-                    self.adapter.send_signal(process.pid, signal.SIGTERM)
-                if candidates:
-                    self.sleeper(config.termination_grace_seconds)
-                    remaining = [
-                        process
-                        for process in self.adapter.list_processes(uid)
-                        if process.uid == uid and rule.bundle_id in process.bundle_ids
-                    ]
-                    for process in remaining:
-                        self.adapter.send_signal(process.pid, signal.SIGKILL)
+            try:
+                matches = [
+                    p
+                    for p in self.adapter.list_processes(uid)
+                    if matches_rule(p, rule, uid)
+                ]
+                mains = [p for p in matches if is_main_process(p, rule)]
+                targets = mains or matches
+                if dry_run:
+                    result.actions.extend(
+                        Action(rule.id, p.pid, signal.SIGTERM) for p in targets
+                    )
+                    continue
+                sent = False
+                for process in targets:
+                    sent |= self._signal(process, rule.id, signal.SIGTERM, result)
+                if not sent:
+                    continue
+                if self.sleeper(config.termination_grace_seconds):
+                    # Shutdown must not shorten the grace period into a force kill.
+                    break
+                for process in matches:
+                    if rule.bundle_id in process.bundle_ids:
+                        self._signal(process, rule.id, signal.SIGKILL, result)
+            except Exception as exc:
+                result.errors.append(f"{rule.id}: {type(exc).__name__}: {exc}")
+        return result
+
+    def _signal(
+        self,
+        process: ProcessInfo,
+        rule_id: str,
+        value: signal.Signals,
+        result: ReconcileResult,
+    ) -> bool:
+        try:
+            if self.adapter.refresh(process.pid, process.uid) != process:
+                return False
+            if self.adapter.send_signal(process, value) is False:
+                return False
+        except ProcessLookupError:
+            return False
+        except OSError as exc:
+            result.errors.append(f"{rule_id}: PID {process.pid}: {exc}")
+            return False
+        result.actions.append(Action(rule_id, process.pid, value))
+        return True
